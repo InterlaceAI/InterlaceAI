@@ -1,0 +1,42 @@
+# Cache y entornos de Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Datos y pesos (van a Drive/Kaggle, no a git)
+data/*
+checkpoints/*
+!data/.gitkeep
+!checkpoints/.gitkeep
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.gguf
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Secretos (NUNCA subir)
+.env
+*.key
+kaggle.json
+docs/benchmarks/fase3_prm/aime_gen.jsonl
+
+# Privado / interno (no publicar)
+NOTAS_INTERNAS.md
+*_INTERNO.md
+
+# GPQA es gated en HF: el set local de eval NO se publica
+nova/data/gpqa_eval_198.json
+# Resultados crudos de evaluación local (van a HF, no a git)
+results/rl_local/
+
+# Copias de seguridad locales
+*.bundle

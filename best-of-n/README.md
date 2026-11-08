@@ -1,0 +1,543 @@
+---
+license: apache-2.0
+library_name: bestofn
+tags:
+  - inference-time-compute
+  - test-time-compute
+  - best-of-n
+  - reasoning
+  - self-consistency
+  - reward-model
+  - evaluation
+language:
+  - en
+---
+
+<div align="center">
+
+<img src="https://huggingface.co/InterlaceAI/best-of-n/resolve/main/figures/interlace-logo.png" width="96" alt="Interlace AI">
+
+**INTERLACE&nbsp;AI**
+
+<!-- auto:title -->
+# Best-of-N&nbsp;1.1.7
+<!-- /auto:title -->
+
+### Your model already knows more than it tells you
+
+*The 1.0 line is withdrawn. See [why](#what-happened-to-10).*
+
+[![PyPI](https://img.shields.io/pypi/v/bestofn?color=blue)](https://pypi.org/project/bestofn/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21936832.svg)](https://doi.org/10.5281/zenodo.21936832)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-235%20passing-brightgreen)](tests/test_selectors.py)
+[![Reproducible](https://img.shields.io/badge/every%20figure-reproducible%20in%202%20min-blueviolet)](results/)
+
+```bash
+pip install bestofn
+```
+
+<img src="https://huggingface.co/InterlaceAI/best-of-n/resolve/main/figures/terminal_bestofn.gif" width="760" alt="Best-of-N in the terminal">
+
+</div>
+
+---
+
+## The idea in one paragraph
+
+A language model does not give you an answer. It gives you a **probability
+distribution over answers**, and generating text draws one sample from it. Ask
+the same question twice and you can get two different results. Most people
+treat that as a defect.
+
+We treat it as an untapped resource. Sample the same frozen model N times and
+select well, and accuracy climbs sharply — **no training, no fine-tuning, no
+new weights**. The knowledge was always in there. It just needed asking more
+than once.
+
+<div align="center">
+
+<!-- auto:headline -->
+| | single sample | **Best-of-128** |
+|---|---:|---:|
+| **GSM8K**, Qwen2.5-0.5B frozen | 45.3% | **66.5%** |
+
+**+21.2 points. Nothing was trained.**
+<!-- /auto:headline -->
+
+</div>
+
+---
+
+## Why voting works so well
+
+Here is the asymmetry that makes the whole thing run, and it is more elegant
+than it first looks:
+
+> **Correct answers agree with each other. Wrong answers scatter.**
+
+A wrong trajectory has a thousand different ways to be wrong and picks a
+different one each time, so errors split into singletons. The correct answer is
+the only thing several attempts can converge on together.
+
+That is why counting votes recovers answers only a small minority reached. The
+model does not need to be right most of the time — it needs to be right *more
+consistently than it is wrong in any one particular way*.
+
+---
+
+## Quickstart
+
+```python
+from bestofn import BestOfN
+
+engine = BestOfN("Qwen/Qwen2.5-0.5B-Instruct", n=16)
+r = engine.solve("A train travels at 60 km/h for 3 hours. How far does it go?")
+
+r.answer          # '180'
+r.agreement       # 0.81   how strongly the trajectories agreed
+r.effective_n     # 15     how many produced a usable answer
+```
+
+Works with any causal LM, at any N:
+
+```python
+BestOfN("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", n=32)
+BestOfN("meta-llama/Llama-3.1-8B-Instruct", n=16)
+BestOfN("/path/to/your/local/model", n=128)
+```
+
+Both backends are tested on real hardware: `transformers` runs anywhere torch
+runs, and `vllm` is dramatically faster at large N — it is the one the
+measurements below were generated with.
+
+---
+
+## Measured results
+
+`Qwen2.5-0.5B-Instruct` on **GSM8K**, 200 problems, **128 trajectories each**,
+weights frozen. Every figure is recomputed from the published trajectories by
+`scripts/analyse.py`, which re-runs extraction over the raw reasoning text.
+
+![GSM8K accuracy against N](https://huggingface.co/InterlaceAI/best-of-n/resolve/main/figures/07_curve_n128.png)
+
+<!-- auto:curve -->
+| N | random | majority | 95% CI | coverage |
+|---:|---:|---:|---:|---:|
+| 1 | 45.3% | 45.3% | [40.3, 50.5] | 45.3% |
+| 2 | 46.4% | 46.5% | [37.0, 50.5] | 56.7% |
+| 4 | 46.1% | 53.0% | [45.0, 58.5] | 66.6% |
+| 8 | 46.2% | 58.3% | [52.0, 65.5] | 75.0% |
+| 16 | 46.1% | 61.8% | [55.0, 68.0] | 81.7% |
+| 32 | 46.5% | 64.0% | [56.0, 69.0] | 86.7% |
+| 64 | 46.1% | 65.5% | [58.5, 72.0] | 90.6% |
+| **128** | 46.3% | **66.5%** | [60.5, 73.0] | **93.5%** |
+<!-- /auto:curve -->
+
+**45.3% to 66.5%** on a half-billion-parameter model, with the weights
+frozen throughout. Against random selection at the same N, exact McNemar gives
+**p ≤ 6.6 × 10⁻⁵** at every one of 200 random seeds, with a median of 8.2 × 10⁻¹⁰.
+
+We quote the worst seed rather than the best, and we say what it is: the worst
+of the 200 we enumerated, not a bound. `random` draws differently on every run,
+so its p-value has a distribution and a wider sweep will find a worse seed. The
+conclusion is what does not move — significant at all 200.
+
+And **coverage reaches 93.5%**: on more than nine problems out of ten, this
+small model does find the right answer somewhere in its 128 attempts. That is
+the number that says how much is still on the table.
+
+### How much of the gain is really selection
+
+Most reports skip this, and it is the part that decides whether a headline
+means anything:
+
+| | | |
+|---|---:|---:|
+<!-- auto:decomposition -->
+| | | |
+|---|---:|---:|
+| N=1, a single sample | 45.3% | |
+| N=128, **random** among the trajectories that answered | 46.3% | +1.0 |
+| N=128, **majority vote** | 66.5% | **+20.2** |
+| | | **+21.2 total** |
+<!-- /auto:decomposition -->
+
+Random selection improves slightly with N without selecting anything, because
+with more trajectories one of them usually did not abstain. Separating the two
+shows that **20.2 of the 21.2 points — 95% of the gain — is genuine
+selection**, not an artefact of comparing a one-sample baseline against an
+N-sample system.
+
+We report it this way because that comparison quietly folds the first number
+into the second, and the size of the fold is not knowable in advance. Here it
+is small. It is small *because* the token budget lets trajectories finish; at a
+tighter budget the same experiment would have credited five times as much of
+the gain to the method.
+
+### The selectors we can measure here, against the baseline
+
+<!-- auto:selectors -->
+| selector at N=128 | accuracy | 95% CI |
+|---|---:|---:|
+| `random` (exact expectation) | 46.3% | [38.0, 52.0] |
+| `majority` | **66.5%** | [60.5, 73.0] |
+| `self_certainty` | 66.5% | [60.5, 73.0] |
+| `oracle` (diagnostic ceiling) | 93.5% | [90.0, 96.5] |
+<!-- /auto:selectors -->
+
+`verifier` and `verifier_argmax` are absent because the published trajectories
+carry no reward-model scores — this release ships no reward model, so there was
+nothing to score them with. Plug one in and the same table prints them.
+
+### The accounting
+
+| | |
+|---|---|
+<!-- auto:accounting -->
+| | |
+|---|---|
+| Trajectories generated | 25,600 |
+| Cast a vote | 24,788 — 96.8% |
+| Abstained | 812 — 3.2% |
+| Truncated at the token limit | 216 — 0.8% (215 of them abstained) |
+| Tokens generated | 8,434,157 |
+| Re-extraction drift on replay | **9** |
+<!-- /auto:accounting -->
+
+All 25,600 trajectories are published in full.
+
+---
+
+## It tells you what to do next
+
+Beyond raising accuracy, Best-of-N **measures the two halves of the problem
+separately** and tells you which one you are actually facing. The framing is
+not ours — `pass@k` beside `maj@n` appears in the evaluation harnesses and in
+Snell et al. (2024). What is ours is that it takes one call, and that the
+answer arrives as a decision rather than as two numbers to interpret:
+
+```python
+r = engine.solve(problem)
+
+r.is_correct(gold)   # did the system return the right answer?
+r.covered(gold)      # did any trajectory find it at all?
+```
+
+| returned | reachable | What it means | What to do |
+|:---:|:---:|---|---|
+| ✓ | ✓ | Working | You are done. Consider whether you need this much N |
+| ✗ | ✓ | **The answer is in there** | A selection problem — a verifier recovers it |
+| ✗ | ✗ | Not yet reachable | Raise N, improve the prompt, or use a stronger model |
+
+Two numbers, one decision. Without them you are guessing whether to spend your
+next hour on sampling or on selection.
+
+The library also reports the accounting most tooling hides:
+
+```python
+r.effective_n     # trajectories that actually voted
+r.n_abstained     # produced no usable answer
+r.n_truncated     # ran out of tokens
+r.total_tokens    # what it cost
+```
+
+---
+
+## The same pool always gives the same answer
+
+Shuffle the trajectory pool and every selector returns the same answer.
+`random` is the exception, and only because picking at random is what it is
+for.
+
+That sounds like it should be free. It is not, and it took three separate
+things to make true:
+
+**The equivalence classes cannot be built greedily.** Symbolic equivalence is
+not transitive — a parser accepts `0.3333333333` against `1/3`, and `1/3`
+against `0.33333333333333`, while rejecting the two decimals against each
+other. Compare each new answer against one representative per class and the
+partition you get depends on which answer the model emitted first. We take the
+transitive closure over all pairs instead.
+
+**Weights cannot be accumulated in arrival order.** Float addition is not
+associative, so two permutations of the same weights can differ in the last
+bit — enough to flip a near-tie in a verifier-weighted vote. Totals are summed
+with `math.fsum` over a sorted list, which is exactly rounded.
+
+**Ties cannot break on whichever came first.** Every tie, in every selector,
+resolves on the canonical key.
+
+We check it in the test suite, not by hand. `tests/test_selectors.py` fuzzes
+all five deterministic selectors over pools built to hit the cases that break
+invariance — exact ties, duplicate scores, weights spread across many orders of
+magnitude, and pools past the merge cap — and separately asserts that the
+weight tally itself is unchanged by reordering. Each of the four historical
+bugs has been confirmed to turn that suite red when reintroduced.
+
+It is visible in the published output too: at N=128 the resampled curve draws
+128 trajectories from a pool of 128, so every draw is a permutation of one pool
+and the reported spread is **0.00**. That is a necessary condition rather than
+a proof, which is why the tests carry the weight.
+
+---
+
+## The habit worth building: always print the baseline
+
+```python
+r = engine.solve(problem, n=16)
+
+r.select_with("random", seed=0)     # the honest baseline
+r.select_with("majority")           # how much better is it, really?
+```
+
+Re-running a selector over an existing result is **free** — generation is the
+expensive part — so there is no reason not to. Our own published tables carry
+the random row, because a gain is only a gain relative to something.
+
+| Method | Needs | What it is for |
+|---|---|---|
+| **`random`** | nothing | The baseline. Print it every time |
+| **`majority`** | nothing | The default, and it is strong |
+| `self_certainty` | `logprobs=True` | Weighs votes by the model's own confidence |
+| **`verifier`** | a verifier callable | The one that can promote a minority answer |
+| `verifier_argmax` | a verifier callable | Single best trajectory, no vote |
+| `oracle` | the gold answer | Measures your headroom during development |
+
+---
+
+---
+
+## Does it hold on other models?
+
+That is the first question anyone asks after a single 0.5B result, so we ran
+the same protocol across a size range — same 200 GSM8K problems, same prompt,
+same temperature, same token budget, same N, weights frozen throughout. A
+comparison where the protocol drifts between rows is not a comparison.
+
+![Best-of-N across model scale](https://huggingface.co/InterlaceAI/best-of-n/resolve/main/figures/13_models.png)
+
+<!-- auto:models -->
+| model | one sample | **Best-of-N** | gain | coverage |
+|---|---:|---:|---:|---:|
+| `HuggingFaceTB/SmolLM2-1.7B-Instruct`<br><sub>1.7B, different family · N=64</sub> | 21.7% | **59.0%** | **+37.3** | 86.5% |
+| `Qwen/Qwen2.5-0.5B-Instruct`<br><sub>0.5B general · N=64</sub> | 45.5% | **65.5%** | **+20.0** | 92.5% |
+| `Qwen/Qwen2.5-1.5B-Instruct`<br><sub>1.5B general · N=64</sub> | 68.8% | **80.0%** | **+11.2** | 97.0% |
+| `microsoft/Phi-3-mini-4k-instruct`<br><sub>3.8B, different family · N=64</sub> | 80.9% | **91.0%** | **+10.1** | 100.0% |
+| `Qwen/Qwen2.5-3B-Instruct`<br><sub>3B general · N=64</sub> | 83.0% | **91.0%** | **+8.0** | 98.5% |
+| `Qwen/Qwen2.5-Math-1.5B-Instruct`<br><sub>1.5B maths-tuned · N=64</sub> | 84.3% | **89.5%** | **+5.2** | 95.0% |
+| `Qwen/Qwen2.5-7B-Instruct`<br><sub>7B general · N=64</sub> | 90.1% | **94.0%** | **+3.9** | 98.5% |
+| `Qwen/Qwen3.8-27B-FP8`<br><sub>27B vision-language, text-only, FP8 · N=64</sub> | 95.1% | **97.5%** | **+2.4** | 98.5% |
+<!-- /auto:models -->
+
+<!-- auto:models_prose -->
+Every one of the 8 models we measured improved, by between **+2.4** and **+37.3** points, and none of them was trained. The gain shrinks as the base model gets better — which is what should happen, and is worth saying plainly rather than hiding behind the largest number in the table.
+
+The row that matters more is coverage. It stays above what the vote returns on **every** model, by a median of 9.0 points: even the strongest one here is still failing to return answers it already found. That gap is the whole reason to work on selection rather than on sampling harder.
+<!-- /auto:models_prose -->
+
+Every row is re-derived from that model's own published trajectories, with each
+answer re-extracted from the raw reasoning text rather than read back from
+storage — so a change to the extractor moves these numbers, and we would see
+it. Run `python scripts/run_models.py --rescore results/models` and they come
+out again on a CPU in under a minute.
+
+## Bring your own reward model
+
+Best-of-N works with **any published reward model**, and it makes them work
+correctly:
+
+```python
+from bestofn import BestOfN
+from bestofn.verifiers import from_hub
+
+verifier = from_hub("openbmb/Eurus-RM-7b")          # Apache-2.0
+engine = BestOfN("your/model", n=16, verifier=verifier)
+engine.solve(problem, method="verifier")
+```
+
+<img src="https://huggingface.co/InterlaceAI/best-of-n/resolve/main/figures/verifier_bestofn.gif" width="760" alt="Plugging a reward model into Best-of-N">
+
+Reward models emit **unbounded logits**, not probabilities, and a naive
+implementation silently degrades to a plain majority vote when you hand it one
+— leaving you convinced your verifier is running when it is not. This one
+catches it, tells you exactly what to do, and the adapters apply the sigmoid
+for you.
+
+Licences differ and they govern how you may use the scores. `from_hub` flags
+anything non-permissive, and `verifiers.license_of(model_id)` checks the Hub
+live. The full table is in [USAGE.md](USAGE.md#using-someone-elses-reward-model).
+
+---
+
+## Everything here is checkable
+
+```bash
+pip install "bestofn[math]"
+python scripts/analyse.py     # no GPU needed
+```
+
+The `[math]` extra pulls in `math-verify`, which is what makes `1/2`, `0.5` and
+`\frac{1}{2}` count as one answer. Without it the script still runs and still
+reports, but equivalent answers written differently vote separately and the
+numbers come out slightly lower. Regenerating the figures additionally needs
+`matplotlib`; the analysis itself does not.
+
+The published dataset contains the **complete reasoning text** of every
+trajectory, with `finish_reason`, log-probabilities and token counts — not
+answers extracted earlier by someone else. The analysis re-runs extraction over
+that raw text, computes exact McNemar against the random baseline, and reports
+bootstrap confidence intervals.
+
+That means the numbers above are not asserted, they are **reproduced** — by
+you, in **about two minutes** on a laptop CPU, with no hardware. Very little
+published work in this area can say that.
+
+To regenerate from scratch:
+
+```bash
+python scripts/run_gsm8k.py --backend vllm --n 128 --batch 25
+```
+
+---
+
+## Where it shines
+
+Best-of-N pays off most on:
+
+- **Tasks with one comparable final answer** — mathematics, multiple choice,
+  short factual questions, unit-testable code.
+- **Models that are sometimes right.** The gain is largest when per-sample
+  accuracy sits around 20–60%, which is exactly where small models live on
+  hard problems.
+- **Hardware you already own.** On your own GPU the extra samples cost you
+  nothing but time you were not using. This is the one setting where the
+  economics are simply free.
+
+Practical guidance on choosing N, plugging in a verifier and measuring your own
+task is in [USAGE.md](USAGE.md).
+
+---
+
+## How this compares
+
+Checked against the current published wheels in August 2026, not against
+reputation. Every cell below names the file it came from, so you can verify it
+yourself rather than take our word for it.
+
+| | `lm-eval` 0.4.12 | `dspy` 3.3.1 | `bestofn` |
+|---|---|---|---|
+| Majority vote | 2 task configs, GSM8K only | `majority()` | yes |
+| Answer comparison | one regex | lowercase + strip punctuation | symbolic (`math-verify`) |
+| Coverage in the same table | no | no | **yes** |
+| Random baseline | no | no | **yes** |
+| Abstention accounted for | no | `None` is skipped | **yes, published** |
+| Same answer whatever the order | no | no | **yes** |
+| Replay re-extracts from raw text | writes samples, re-counts them | no | **yes** |
+
+**Where the numbers came from.** `lm-eval`'s self-consistency is
+`lm_eval/tasks/gsm8k/gsm8k-cot-self-consistency.yaml` and its
+`gsm8k_platinum` twin — two files, offering `score-first`, `maj@8` and
+`maj@64`. Its own comment on the `maj@8` filter reads *"Using a better
+estimator would be optimal"*: it takes the first 8 of the 64 rather than
+resampling, which is biased. Extraction is the single pattern
+`The answer is (\-?[0-9\.\,]*[0-9]+)`, so a correct answer written any other
+way scores as wrong, and `pass@k` lives in an unrelated task
+(`lm_eval/tasks/cruxeval/utils.py`) rather than beside `maj@n`.
+
+`dspy.BestOfN` (`dspy/predict/best_of_n.py`) is a different thing that shares
+the name: it takes a `reward_fn`, returns the single highest-scoring
+completion, and stops early at a threshold. It does not vote.
+`dspy.majority` (`dspy/predict/aggregation.py`) does, normalising with
+`normalize_text` — lowercase and strip punctuation — and breaking ties towards
+the earlier completion, so the answer depends on the order the samples arrive
+in.
+
+`trl` 1.12.0 has no `BestOfNSampler`. It was removed; there are zero matches
+for it in the current wheel.
+
+**Where we lose.** `lm-eval` covers hundreds of tasks; we measure one benchmark
+across eight models. We ship no reward model and no process reward model, so
+the 27-point gap between what our models reach and what they return is a gap we
+name rather than close. There is no beam search, no lookahead, no
+compute-optimal allocation — the selectors here are majority voting and a
+confidence weighting, and on our data the confidence weighting does not beat
+the free one. If you need throughput, vLLM and SGLang generate the trajectories
+and this only chooses among them.
+
+---
+
+## Built on solid ground
+
+Inference-time compute is one of the most active areas in the field, and this
+sits squarely inside it:
+
+- Cobbe et al., *Training Verifiers to Solve Math Word Problems*, 2021
+- Wang et al., *Self-Consistency Improves Chain of Thought Reasoning*, 2022
+- Lightman et al., *Let's Verify Step by Step*, 2023
+- Snell et al., *Scaling LLM Test-Time Compute Optimally*, 2024
+- Brown et al., *Large Language Monkeys*, 2024
+
+What this adds: the **selection layer the serving stacks deliberately leave
+out** — vLLM removed `best_of` in 2025, SGLang discourages `n>1`, LMDeploy
+supports only 1 — a single small API over six interchangeable selectors, and
+the raw trajectories behind every number we publish.
+
+---
+
+## What happened to 1.0
+
+**Version 1.0 is withdrawn. Its numbers should not be cited, including by us.**
+
+It reported 83.3% coverage on AIME 2024 and credited a trained outcome reward
+model with a 16.6-point gain over majority voting. An adversarial audit of the
+published package found defects in answer extraction and in the handling of
+truncated trajectories that corrupted the inputs to the vote:
+
+- Fractions and radicals collapsed onto their first digit, so one half, one
+  third and minus one half all compared equal.
+- Commas were deleted unconditionally, so the ordered pair `(3,4)` became the
+  integer `34` — a fabricated answer, not a lost one.
+- A trajectory cut off mid-reasoning contributed "the last number in its text"
+  as a vote, indistinguishable from a real one.
+
+Those measurements are not reproducible with the corrected implementation.
+Separately, the reward model was never published, the problem set it was
+measured on was never published, and in the one evidence file that was, it
+selected the same answer as majority voting on all 30 problems — a net gain of
+zero.
+
+**1.1 ships no reward model.** It provides adapters for third-party ones, with
+the range validation that stops a reward model's unbounded logits from silently
+degrading a weighted vote into an unweighted one.
+
+Everything in this card is GSM8K, measured with the version in the badge above,
+and reproducible from the trajectories published alongside it. The full account
+is in [the technical note](TR-2026-02.md) and the
+[changelog](CHANGELOG.md).
+
+---
+
+## Citation
+
+```bibtex
+@software{arecesrivera2026bestofn,
+  title  = {Best-of-N: inference-time compute for language models},
+  author = {Areces Rivera, Alejandro},
+  year   = {2026},
+  doi    = {10.5281/zenodo.21936832},
+  url    = {https://github.com/voidlinestudios12-jpg/Interlace-AI}
+}
+```
+
+---
+
+## License
+
+**Apache License 2.0** — free to use, modify and redistribute, including
+commercially.
+
+Copyright 2026 Alejandro Areces Rivera — Interlace AI
+
+Questions and collaboration: `interlaceIA@gmail.com`
+Release notes: [CHANGELOG.md](CHANGELOG.md)

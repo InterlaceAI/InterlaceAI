@@ -1,0 +1,546 @@
+# -*- coding: utf-8 -*-
+"""Re-derive every published number from the published trajectories.
+
+This is a replay that can fail. The 1.0.0 script loaded answers somebody had
+already extracted and re-counted the votes, so by construction it could not
+detect an extraction bug -- and there were two. This one starts from the raw
+reasoning text and runs the real extractor over it, so if extraction breaks,
+the numbers move and the check fails.
+
+What it reports, and why each part is there:
+
+* a **random-selection baseline** in every table. A selector that does not beat
+  picking a trajectory at random is anti-correlated with correctness, and
+  without this row no selector claim is interpretable.
+* **effective N** alongside N. The N you paid for is not the N that voted.
+* **bootstrap confidence intervals**, because a 30- or 200-problem benchmark
+  has error bars wide enough to swallow most reported differences.
+* **exact McNemar** for every pairwise comparison, on the paired discordance
+  counts rather than on the difference of two percentages.
+* the **variance curve by resampling**: drawing k of the N trajectories many
+  times gives sigma(N) with real error bars and no extra GPU time.
+
+Run:  python scripts/analyse.py [path/to/trajectories.jsonl]
+
+Copyright 2026 Alejandro Areces Rivera - Interlace AI. Apache License 2.0.
+"""
+import io
+import json
+import math
+import os
+import random
+import statistics
+import sys
+import warnings
+
+# The symbolic-merge cap fires once per select() call at large N, and this
+# script makes hundreds of thousands of them, so printing the warning each
+# time would bury the results. It is counted here instead of silenced, and
+# reported with the rest of the accounting.
+#
+# An earlier version of this comment justified silencing it on the grounds
+# that "GSM8K answers are plain integers, so merging has nothing to do". That
+# was wrong, and worth recording: the pools also contain non-integer keys from
+# truncated and malformed trajectories, and on some problems the distinct
+# answer count really does exceed the cap. Whether that moves the published
+# numbers is now measured rather than assumed.
+# Silenced for output, counted at the source. Counting the *warnings* is
+# what the previous version did and it under-reported by 73x: Python's filter
+# shows a given warning once per location, so repeats never reach the handler.
+# bestofn.select keeps the real tally.
+warnings.filterwarnings("ignore", message=".*symbolic merge limit.*")
+
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from bestofn import Sample, coverage, normalise, select      # noqa: E402
+from bestofn.extract import equivalent                       # noqa: E402
+from bestofn.select import merge_calls, merge_cap_hits       # noqa: E402
+
+
+def exact_coverage(samples, golds, k: int) -> float:
+    """Closed-form pass@k: the chance that k of the pool contains a hit.
+
+    ``1 - C(n-c, k) / C(n, k)`` where ``c`` of the ``n`` trajectories are
+    correct -- the unbiased estimator from Chen et al. (2021), standard since
+    Codex. Resampling it 200 times instead cost up to 0.20 points of avoidable
+    noise on the published curve.
+
+    This release argues, at length, for computing a baseline rather than
+    estimating it. That argument was applied to ``random`` and not to
+    coverage, which is the other headline number and the one the 27-point gap
+    is measured from.
+    """
+    total = 0.0
+    for pool, g in zip(samples, golds):
+        n = len(pool)
+        if k > n:
+            continue
+        c = sum(1 for x in pool if hit(x.key, g))
+        # P(no hit among k drawn without replacement) = C(n-c, k) / C(n, k)
+        total += 1.0 - (math.comb(n - c, k) / math.comb(n, k)
+                        if n - c >= k else 0.0)
+    return 100.0 * total / len(golds)
+
+
+def exact_random(samples, golds) -> float:
+    """Closed-form accuracy of picking uniformly among the voters.
+
+    ``random`` chooses among the trajectories that produced an answer, so on
+    one problem it is right with probability (correct voters)/(voters), and
+    over problems the baseline is the mean of that. A problem where everything
+    abstained contributes zero, because the selector returns nothing.
+
+    Computed rather than sampled. Two Monte-Carlo estimates of this same number
+    were being published side by side and disagreeing by a few tenths, which is
+    both avoidable and exactly the kind of discrepancy this report exists to
+    catch in other people's work.
+    """
+    total = 0.0
+    for pool, g in zip(samples, golds):
+        voters = [x for x in pool if x.key]
+        if not voters:
+            continue
+        total += sum(1 for x in voters if hit(x.key, g)) / len(voters)
+    return 100.0 * total / len(golds)
+
+
+def rseed(seed: int, problem: int) -> int:
+    """A distinct random-selection seed for each (replicate, problem) pair.
+
+    ``select(..., "random", seed=s)`` constructs ``random.Random(s)`` inside
+    the call, so passing the same ``s`` for every problem makes all 200 draw
+    from the same stream position. At seed 1 that meant picking from the first
+    7% of every pool. The draws were correlated across problems, which both
+    inflated the reported spread and made the seed sweep a poor exploration of
+    what `random` can do. Mixing the problem index in fixes it while keeping
+    the whole thing reproducible.
+    """
+    return (seed * 1_000_003 + problem * 9_176_411) % (2 ** 31 - 1)
+
+
+def hit(answer, gold) -> bool:
+    """Whether a returned answer counts as correct.
+
+    One rule for the whole report. This script used to compare canonical keys
+    with ``==`` while ``coverage()`` in the same table used symbolic
+    equivalence, so the coverage column was scored more generously than the
+    accuracy columns beside it -- and more generously than
+    ``Result.is_correct``, which is what a reader of these numbers will
+    actually run. Two criteria in one report is how a selection gap gets
+    reported wider than it is.
+    """
+    if not answer:
+        return False
+    return equivalent(answer, gold)
+from bestofn.extract import extract_boxed                    # noqa: E402
+
+CURVE = (1, 2, 4, 8, 16, 32, 64, 128)
+#: How many random seeds the paired significance test runs over. One seed
+#: gives a p-value that varies by orders of magnitude between runs.
+P_SEEDS = 200
+RESAMPLES = 200
+BOOTSTRAP = 2000
+SEED = 20260817
+
+
+# ------------------------------------------------------------------ statistics
+
+def mcnemar_exact(only_a: int, only_b: int) -> float:
+    """Two-sided exact McNemar p-value from the discordant pairs alone.
+
+    Comparing two selectors by subtracting their accuracies throws away the
+    pairing. What matters is: on how many problems did A win and B lose, and
+    vice versa. Everything else cancels.
+    """
+    n = only_a + only_b
+    if n == 0:
+        return 1.0
+    k = min(only_a, only_b)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / (2 ** n)
+    return min(1.0, 2.0 * tail)
+
+
+def bootstrap_ci(hits, n_boot=BOOTSTRAP, seed=SEED, alpha=0.05):
+    """Percentile confidence interval for a mean over problems."""
+    if not hits:
+        return (0.0, 0.0)
+    rng = random.Random(seed)
+    n = len(hits)
+    means = []
+    for _ in range(n_boot):
+        means.append(sum(hits[rng.randrange(n)] for _ in range(n)) / n)
+    means.sort()
+    lo = means[int(alpha / 2 * n_boot)]
+    hi = means[min(n_boot - 1, int((1 - alpha / 2) * n_boot))]
+    return (100 * lo, 100 * hi)
+
+
+# ---------------------------------------------------------------------- data
+
+def load(path):
+    rows = []
+    with io.open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def rebuild(row):
+    """Re-extract every trajectory from its raw text.
+
+    Deliberately ignores the stored ``answer`` field. If the extractor has
+    changed -- or regressed -- this is where it shows up.
+    """
+    out, drifted = [], 0
+    for t in row["trajectories"]:
+        fresh = extract_boxed(t["text"])
+        if fresh != t.get("answer"):
+            drifted += 1
+        out.append(Sample(
+            answer=fresh,
+            text=t["text"],
+            logprob=t.get("logprob"),
+            finish_reason=t.get("finish_reason"),
+            n_tokens=t.get("n_tokens"),
+        ))
+    return out, drifted
+
+
+# ---------------------------------------------------------------------- main
+
+def main():
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    argv = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    args_out = None
+    for f in flags:
+        if f.startswith("--out="):
+            args_out = f.split("=", 1)[1]
+    path = argv[0] if argv else os.path.join(
+        here, "results", "gsm8k_trajectories.jsonl")
+    if not os.path.exists(path):
+        print(f"not found: {path}\nRun scripts/run_gsm8k.py first.")
+        return 1
+
+    # Zero both counters: they are process-global, so anything imported or
+    # run before this point would otherwise be folded into the published
+    # figure.
+    merge_cap_hits(reset=True)
+    merge_calls(reset=True)
+
+    rows = load(path)
+    problems = [rebuild(r) for r in rows]
+    samples = [p[0] for p in problems]
+    drift = sum(p[1] for p in problems)
+    golds = [r["gold"] for r in rows]
+    n_max = min(len(s) for s in samples)
+    n_prob = len(rows)
+
+    print("=" * 74)
+    print("RE-DERIVED FROM THE PUBLISHED TRAJECTORIES")
+    print("=" * 74)
+    print(f"  problems              : {n_prob}")
+    print(f"  trajectories each     : {n_max}")
+    print(f"  re-extraction drift   : {drift} "
+          f"({'clean' if drift == 0 else 'EXTRACTOR CHANGED SINCE GENERATION'})")
+
+    # ------------------------------------------------------------ accounting
+    total = sum(len(s) for s in samples)
+    voting = sum(1 for s in samples for x in s if x.key)
+    trunc = sum(1 for s in samples for x in s if x.truncated)
+    # Counted, not inferred. Subtracting truncations from abstentions assumes
+    # every truncated trajectory abstains, and one of them here did box an
+    # answer before running out of room -- so the published split was 216+587
+    # where the data says 215+588.
+    trunc_abstained = sum(1 for s in samples for x in s
+                          if x.truncated and not x.key)
+    trunc_voted = trunc - trunc_abstained
+    toks = sum(x.n_tokens or 0 for s in samples for x in s)
+    print(f"\n  trajectories total    : {total}")
+    print(f"  cast a vote           : {voting}  ({100*voting/total:.1f}%)")
+    print(f"  abstained             : {total-voting}  "
+          f"({100*(total-voting)/total:.1f}%)")
+    print(f"  truncated             : {trunc}  ({100*trunc/total:.1f}%)")
+    print(f"    of which abstained  : {trunc_abstained}")
+    print(f"    of which still voted: {trunc_voted}  "
+          f"(boxed an answer before running out of room)")
+    print(f"  generated tokens      : {toks:,}")
+
+    # ------------------------------------------- per-trajectory accuracy (p)
+    hits = [sum(1 for x in s if hit(x.key, g))
+            for s, g in zip(samples, golds)]
+    p_bar = sum(hits) / total
+    print(f"\n  per-trajectory accuracy (p): {100*p_bar:.1f}%")
+    print("  This is what selecting at random gets you. Every selector below")
+    print("  has to beat it to be worth anything.")
+
+    # ------------------------------------------------------------- the curve
+    print("\n" + "=" * 74)
+    print("ACCURACY BY N   (mean over "
+          f"{RESAMPLES} resamples, 95% bootstrap CI over problems)")
+    print("=" * 74)
+    hdr = f"\n  {'N':>3}  {'random':>16}  {'majority':>16}  {'coverage':>16}"
+    print(hdr)
+    print("  " + "-" * 58)
+
+    rng = random.Random(SEED)
+    curve = []
+    for n in CURVE:
+        if n == 1:
+            # Exact, not estimated. At N=1 majority, random and coverage are
+            # all "did the single drawn trajectory hit gold", whose expectation
+            # over a uniform draw is precisely the per-trajectory accuracy
+            # computed above. Resampling it 200 times produced an estimate with
+            # a 0.17-point standard error, and that noise was propagating into
+            # the headline decomposition -- the 45.0-to-45.1 movement between
+            # two releases was inside it.
+            e = round(100 * p_bar, 2)
+            # Bootstrapped over PROBLEMS, like every other row in this
+            # table. Resampling the 25,600 trajectories as if they were
+            # independent ignores the 128-way clustering inside each problem
+            # and gave [44.7, 45.9] -- a design effect of 70, an interval 8.5
+            # times too narrow, and printed directly beneath rows whose
+            # intervals mean something different. The baseline of the whole
+            # +21.2 headline is not the place for the tightest-looking number.
+            per_problem = [statistics.fmean([1.0 if hit(x.key, g) else 0.0
+                                             for x in s])
+                           for s, g in zip(samples, golds)]
+            lo1, hi1 = bootstrap_ci(per_problem)
+            curve.append({"n": 1, "random": e, "majority": e, "coverage": e,
+                          "sd": 0.0, "majority_ci95": [round(lo1, 2),
+                                                       round(hi1, 2)],
+                          "exact": True})
+            print(f"  {1:>3}  {e:>10.1f}%  {e:>10.1f}%  "
+                  f"[{lo1:.1f}, {hi1:.1f}]  {e:>10.1f}%  exact")
+            continue
+        if n > n_max:
+            continue
+        rnd_hits, maj_hits, cov_hits, sigmas = [], [], [], []
+        for rep in range(RESAMPLES):
+            r_ok = m_ok = c_ok = 0
+            for _i, (s, g) in enumerate(zip(samples, golds)):
+                draw = rng.sample(s, n)
+                # Go through the library's own selectors rather than
+                # reimplementing the vote here. A published curve that bypasses
+                # select() does not exercise tie-breaking or answer merging,
+                # and can drift from what users actually get.
+                if hit(select(draw, "majority"), g):
+                    m_ok += 1
+                if hit(select(draw, "random", seed=rseed(rep, _i)), g):
+                    r_ok += 1
+                if coverage(draw, g):
+                    c_ok += 1
+            rnd_hits.append(r_ok / n_prob)
+            maj_hits.append(m_ok / n_prob)
+            cov_hits.append(c_ok / n_prob)
+            sigmas.append(m_ok / n_prob)
+
+        rnd, maj, cov = (100 * statistics.fmean(x)
+                         for x in (rnd_hits, maj_hits, cov_hits))
+        # Coverage has a closed form at every k, not just at the full pool.
+        cov = exact_coverage(samples, golds, n)
+        if n == n_max:
+            # Every draw at full N is a permutation of the whole pool, so the
+            # resampled mean is estimating a quantity we can just compute.
+            rnd = exact_random(samples, golds)
+        sd = 100 * statistics.pstdev(sigmas)
+        # Confidence interval over problems, from one representative draw --
+        # the resample spread (sd) and the sampling error over problems are
+        # different quantities and both belong in the table.
+        one = [1.0 if hit(select(rng.sample(s, n), "majority"), g)
+               else 0.0 for s, g in zip(samples, golds)]
+        lo, hi = bootstrap_ci(one)
+        curve.append({"n": n, "random": round(rnd, 2), "majority": round(maj, 2),
+                      "coverage": round(cov, 2), "sd": round(sd, 3),
+                      "majority_ci95": [round(lo, 2), round(hi, 2)]})
+        print(f"  {n:>3}  {rnd:>10.1f}%  {maj:>10.1f}%  "
+              f"[{lo:.1f}, {hi:.1f}]  {cov:>10.1f}%  sd={sd:.2f}")
+
+    print("  " + "-" * 58)
+    print(f"\n  sd is over resamples. At N={n_max} the pool is exhausted, so"
+          f"\n  there is nothing left to resample and that row is degenerate."
+          f"\n  Do not read it as variance reduction.")
+
+    if curve:
+        base, top = curve[0]["majority"], curve[-1]["majority"]
+        rnd_lo, rnd_hi = curve[0]["random"], curve[-1]["random"]
+        print("\n" + "=" * 74)
+        print("WHERE THE GAIN ACTUALLY COMES FROM")
+        print("=" * 74)
+        print(f"\n  N=1 single sample                     {base:>6.1f}%")
+        print(f"  N={curve[-1]['n']} random among the voters        "
+              f"{rnd_hi:>6.1f}%   {rnd_hi-rnd_lo:+.1f}")
+        print(f"  N={curve[-1]['n']} majority vote                  "
+              f"{top:>6.1f}%   {top-rnd_hi:+.1f}")
+        print(f"  {'-'*54}")
+        print(f"  total                                 "
+              f"{top-base:+.1f} points")
+        print(f"\n  Read that middle row carefully. Random selection improves")
+        print(f"  with N without selecting anything, because with more")
+        print(f"  trajectories there is almost always one that did not")
+        print(f"  abstain. Of the {top-base:.1f} points, "
+              f"{rnd_hi-rnd_lo:.1f} are just avoiding")
+        print(f"  abstention and only {top-rnd_hi:.1f} come from voting.")
+        print(f"\n  Anyone reporting a single-sample baseline against an N-sample")
+        print(f"  system is quietly counting the first part as method.")
+
+    # ------------------------------------------------- paired significance
+    print("\n" + "=" * 74)
+    print("IS THE DIFFERENCE REAL?   exact McNemar on paired discordances")
+    print("=" * 74)
+    maj_pick = [select(s, "majority") for s in samples]
+
+    # `random` is a different draw for every seed, so a p-value computed from
+    # one of them is a property of that seed as much as of the data. Running
+    # the comparison over many seeds and reporting the worst case says what
+    # the evidence actually supports; quoting a single seed's 3.2e-08 as
+    # though it were a fixed quantity does not.
+    trials = []
+    for sd in range(P_SEEDS):
+        rnd_pick = [select(s, "random", seed=rseed(sd, i))
+                    for i, s in enumerate(samples)]
+        a = sum(1 for m, r, g in zip(maj_pick, rnd_pick, golds)
+                if hit(m, g) and not hit(r, g))
+        b = sum(1 for m, r, g in zip(maj_pick, rnd_pick, golds)
+                if hit(r, g) and not hit(m, g))
+        trials.append((mcnemar_exact(a, b), a, b))
+    trials.sort()
+    p_worst, a_worst, b_worst = trials[-1]
+    p_med, a_med, b_med = trials[len(trials) // 2]
+    p_best = trials[0][0]
+
+    full = [(m, r, g) for m, r, g in
+            zip(maj_pick, [select(s, "random", seed=rseed(SEED, i))
+                           for i, s in enumerate(samples)], golds)]
+    maj_only = sum(1 for m, r, g in full if hit(m, g) and not hit(r, g))
+    rnd_only = sum(1 for m, r, g in full if hit(r, g) and not hit(m, g))
+    p = mcnemar_exact(maj_only, rnd_only)
+
+    print(f"\n  majority vs random, N={n_max}, over {P_SEEDS} random seeds")
+    print(f"    median   : {a_med} vs {b_med} discordances, p = {p_med:.3g}")
+    print(f"    worst    : {a_worst} vs {b_worst} discordances, "
+          f"p = {p_worst:.3g}")
+    print(f"    best     : p = {p_best:.3g}")
+    print(f"    {'significant at every seed' if p_worst < 0.05 else 'NOT significant at some seed'}")
+    print(f"\n    Quote p <= {p_worst:.3g}, and say what it is: the worst of")
+    print(f"    the {P_SEEDS} seeds enumerated here, not a bound. `random` is a")
+    print(f"    different draw every time, so the p-value has a distribution;")
+    print(f"    a wider sweep finds a worse seed. A single seed gave {p:.3g}.")
+    print(f"    What does not move is the conclusion: significant at all {P_SEEDS}.")
+
+    # -------------------------------------------- every selector vs random
+    print("\n" + "=" * 74)
+    print("EVERY SELECTOR AT N=%d   (random is the bar each one must clear)"
+          % n_max)
+    print("=" * 74 + "\n")
+    rows = []
+    for name in ("random", "majority", "self_certainty", "oracle"):
+        if name == "random":
+            # Averaged over seeds, not taken from one. A single seeded draw
+            # of `random` landed on 47.5% where the mean is 46.4% -- half a
+            # standard deviation out, and it was published beside the curve's
+            # own 46.3% as though the two were the same quantity.
+            # Exact, and the same value the curve reports at this N. The
+            # spread over seeds is still worth printing -- it says how much a
+            # single run of `random` can flatter or embarrass you -- but the
+            # number in the table is not an estimate any more.
+            per_seed = []
+            for sd in range(P_SEEDS):
+                pick = [select(sm, "random", seed=rseed(sd, i))
+                        for i, sm in enumerate(samples)]
+                per_seed.append(statistics.fmean(
+                    [1.0 if hit(a, g) else 0.0 for a, g in zip(pick, golds)]))
+            acc = exact_random(samples, golds)
+            sd_seeds = 100 * statistics.pstdev(per_seed)
+            hits01 = [1.0 if hit(a, g) else 0.0 for a, g in
+                      zip([select(sm, "random", seed=rseed(SEED, i))
+                           for i, sm in enumerate(samples)], golds)]
+            clo, chi = bootstrap_ci(hits01)
+            rows.append({"selector": name, "accuracy": round(acc, 2),
+                         "ci95": [round(clo, 2), round(chi, 2)],
+                         "exact": True, "seeds": P_SEEDS,
+                         "sd_over_seeds": round(sd_seeds, 2)})
+            print("  %-16s %6.1f%%   95%% CI [%.1f, %.1f]   "
+                  "(exact; one run of %d seeds varies by sd %.1f)"
+                  % (name, acc, clo, chi, P_SEEDS, sd_seeds))
+            continue
+        if name == "oracle":
+            got = [select(sm, "oracle", gold=g) for sm, g in zip(samples, golds)]
+        else:
+            got = [select(sm, name) for sm in samples]
+        hits01 = [1.0 if hit(a, g) else 0.0 for a, g in zip(got, golds)]
+        acc = 100 * statistics.fmean(hits01)
+        clo, chi = bootstrap_ci(hits01)
+        rows.append({"selector": name, "accuracy": round(acc, 2),
+                     "ci95": [round(clo, 2), round(chi, 2)]})
+        print("  %-16s %6.1f%%   95%% CI [%.1f, %.1f]" % (name, acc, clo, chi))
+    print("\n  Every selector above clears the random baseline. Majority needs")
+    print("  nothing but the answers; self_certainty additionally needs")
+    print("  log-probabilities, so majority stays the default unless your own")
+    print("  task shows the other one pulling ahead. Print both and look.")
+
+    maj_hits01 = [1.0 if hit(m, g) else 0.0 for m, _, g in full]
+    lo, hi = bootstrap_ci(maj_hits01)
+    print(f"\n  majority accuracy at N={n_max}: "
+          f"{100*statistics.fmean(maj_hits01):.1f}%  95% CI [{lo:.1f}, {hi:.1f}]")
+
+    # ------------------------------------------------------------- summary
+    # Derived from the input, never fixed. This used to be hard-coded to
+    # results/gsm8k_summary.json regardless of which trajectory file was
+    # analysed -- and that one file is what make_figures.py, marca.py and
+    # sync_docs.py all read, so pointing this script at any other dataset
+    # silently replaced every published number with that dataset's. The
+    # docstring of run_models.py invites exactly that.
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = stem[:-len("_trajectories")] if stem.endswith("_trajectories") else stem
+    out = args_out or os.path.join(os.path.dirname(path) or ".",
+                                   stem + "_summary.json")
+    with io.open(out, "w", encoding="utf-8") as fh:
+        json.dump({
+            "problems": n_prob, "n_generated": n_max,
+            "per_trajectory_accuracy": round(100 * p_bar, 2),
+            "abstention_rate": round(100 * (total - voting) / total, 2),
+            "truncation_rate": round(100 * trunc / total, 2),
+            # Exact counts as well as rates. A figure that multiplies a
+            # rounded percentage back out lands a couple of trajectories away
+            # from the truth and then disagrees with the technical note.
+            "n_trajectories": total,
+            "n_voting": voting,
+            "n_abstained": total - voting,
+            "n_truncated": trunc,
+            "n_truncated_and_abstained": trunc_abstained,
+            "n_truncated_but_voted": trunc_voted,
+            "n_abstained_not_truncated": (total - voting) - trunc_abstained,
+            "total_tokens": toks,
+            "curve": curve,
+            "mcnemar_majority_vs_random": {
+                "seeds": P_SEEDS,
+                "p_value_worst": float("%.4g" % p_worst),
+                "p_value_median": float("%.4g" % p_med),
+                "discordances_median": [a_med, b_med],
+                "majority_only": maj_only, "random_only": rnd_only,
+                # Not round(p, 6). This p-value is 3.24e-08, and rounding
+                # it to six decimal places publishes 0.0 -- which reads as
+                # "exactly zero" and is not the number we computed.
+                "p_value": float("%.4g" % p),
+            },
+            "selectors_at_n_max": rows,
+            "symbolic_merge_capped_calls": merge_cap_hits(),
+            "symbolic_merge_calls": merge_calls(),
+            "reextraction_drift": drift,
+        }, fh, indent=2)
+    # Reset at the start of the run and reported with a denominator: a bare
+    # count says nothing without knowing how many calls there were, and the
+    # counter is process-global so anything that ran before would be included.
+    print("\n  merge-cap fallbacks: %s of %s grouping calls (%.2f%%)"
+          % (format(merge_cap_hits(), ","), format(merge_calls(), ","),
+             100.0 * merge_cap_hits() / max(1, merge_calls())))
+    print(f"\n  summary written to {os.path.relpath(out, here)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
